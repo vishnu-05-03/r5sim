@@ -86,6 +86,9 @@ void five_stage_pipeline(register_file *reg_file) {
     int stall_pipeline = 0;
     int insert_nop = 0;
     
+    // Program end detection
+    int end_of_program = 0;
+    
     // Temp PC register to maintain PC correctly during stalls
     reg_t temp_pc = reg_file->pc;
     int cycles = 0;
@@ -94,7 +97,7 @@ void five_stage_pipeline(register_file *reg_file) {
     
     printf("\n===== Starting Five-Stage Pipeline Simulation =====\n");
     
-    while (instructions_completed < max_instructions) {
+    while (instructions_completed < max_instructions && !end_of_program) {
         cycles++;
         printf("\n--- Clock Cycle %d ---\n", cycles);
         
@@ -128,7 +131,17 @@ void five_stage_pipeline(register_file *reg_file) {
                 .mem_addr = ex_mem.mem_addr,
                 .updated_pc = ex_mem.updated_pc
             };
+            
+            // For store instructions, we need to pass the data to be stored
+            // but we can't directly set rs2_data as it's not in mem_data struct
+            // Instead, we'll need to handle it in our custom memory transaction function
+            
             write_back_data mem_data_out = memory_transaction(mem_data_in, mem);
+            
+            // For debugging memory operations
+            if (ex_mem.instruction_name == sb || ex_mem.instruction_name == lb) {
+                print_mem_byte(mem, ex_mem.mem_addr);
+            }
             
             mem_wb.instruction_name = mem_data_out.instruction_name;
             mem_wb.rd = mem_data_out.rd;
@@ -179,6 +192,12 @@ void five_stage_pipeline(register_file *reg_file) {
             uint8_t rs1 = (instr >> 15) & 0x1F;
             uint8_t rs2 = (instr >> 20) & 0x1F;
             
+            // Special case for S-type instructions where rs2 is in different position
+            uint8_t opcode = instr & 0x7F;
+            if (opcode == 0x23) { // Store instructions
+                rs2 = (instr >> 20) & 0x1F;
+            }
+            
             id_ex.instruction_name = decoded.instruction_name;
             id_ex.rs1_data = decoded.rs1_data;
             id_ex.rs2_data = decoded.rs2_data;
@@ -188,26 +207,26 @@ void five_stage_pipeline(register_file *reg_file) {
             id_ex.sign_ext_imm = decoded.sign_ext_imm;
             id_ex.pc = if_id.pc;
             
-            // RAW Hazard Detection
-            // Check if ID stage has a dependency on instructions in EX or MEM stages
+            // RAW Hazard Detection - Check both EX/MEM and MEM/WB stages
             insert_nop = 0;
             if (ex_mem.valid && ex_mem.rd != 0) {
                 if ((rs1 != 0 && rs1 == ex_mem.rd) || 
                     (rs2 != 0 && rs2 == ex_mem.rd)) {
-                    // RAW hazard detected with instruction in EX/MEM
-                    printf("ID: RAW hazard detected with EX/MEM stage (reg %d). Inserting NOP\n", 
+                    printf("ID: RAW hazard detected with EX/MEM stage (reg x%d). Inserting NOP\n", 
                            rs1 == ex_mem.rd ? rs1 : rs2);
                     insert_nop = 1;
+                    stall_pipeline = 1; // Also stall the pipeline to keep fetch from advancing
                 }
             }
-            
+
+            // Add check for MEM/WB stage too - needed for address dependencies
             if (mem_wb.valid && mem_wb.rd != 0) {
                 if ((rs1 != 0 && rs1 == mem_wb.rd) || 
                     (rs2 != 0 && rs2 == mem_wb.rd)) {
-                    // RAW hazard detected with instruction in MEM/WB
-                    printf("ID: RAW hazard detected with MEM/WB stage (reg %d). Inserting NOP\n", 
+                    printf("ID: RAW hazard detected with MEM/WB stage (reg x%d). Inserting NOP\n", 
                            rs1 == mem_wb.rd ? rs1 : rs2);
                     insert_nop = 1;
+                    stall_pipeline = 1;
                 }
             }
         } else {
@@ -218,33 +237,42 @@ void five_stage_pipeline(register_file *reg_file) {
         // =====================================================================
         // FETCH STAGE 
         // =====================================================================
-        if_id.valid = !stall_pipeline;
         if (!stall_pipeline) {
             // Save the current PC for this instruction
             reg_t current_pc = reg_file->pc;
             
-            instr_t fetched = fetch_instruction(mem);
-            printf("IF: Fetched instruction 0x%08x from PC 0x%08x\n", fetched, current_pc);
-            
-            if_id.instruction = fetched;
-            if_id.pc = current_pc;
-            
-            // Check if we need to stall next cycle due to hazards
-            stall_pipeline = insert_nop;
+            if (current_pc < 0x08000000 || current_pc >= 0x08000100) {
+                printf("IF: PC out of program memory range (0x%08x), assuming end of program\n", current_pc);
+                end_of_program = 1;
+                if_id.valid = 0;
+            } else {
+                instr_t fetched = fetch_instruction(mem);
+                printf("IF: Fetched instruction 0x%08x from PC 0x%08x\n", fetched, current_pc);
+                
+                if_id.instruction = fetched;
+                if_id.pc = current_pc;
+                if_id.valid = 1;
+                
+                // Check for program termination - null instruction (all zeros)
+                if (fetched == 0) {
+                    printf("IF: Detected null instruction, end of program\n");
+                    end_of_program = 1;
+                }
+            }
         } else {
             printf("IF: Pipeline stalled, no fetch\n");
-            stall_pipeline = 0;  // Reset stall for next cycle
+            stall_pipeline = 0;  // Reset stall for next cycle if no new hazards
         }
         
-        // Print register file state at the end of each cycle
-        if (cycles % 5 == 0) {
+        // Print register file state periodically
+        if (cycles % 5 == 0 || cycles == 1) {
             printf("\nRegister file state after cycle %d:\n", cycles);
             reg_file_print(reg_file);
         }
         
-        // Exit loop if all instructions have NOP or if we reached the end of the program
-        if (!if_id.valid && !id_ex.valid && !ex_mem.valid && !mem_wb.valid) {
-            printf("\nAll pipeline stages empty. Simulation complete.\n");
+        // Check for empty pipeline - only if we've also reached end of program
+        if (end_of_program && !if_id.valid && !id_ex.valid && !ex_mem.valid && !mem_wb.valid) {
+            printf("\nAll pipeline stages empty and end of program reached. Simulation complete.\n");
             break;
         }
     }
